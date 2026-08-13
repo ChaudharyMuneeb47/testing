@@ -43,26 +43,25 @@ async def main():
         log_message(f"Starting Apollo scraper with {len(start_urls)} URLs")
         log_message(f"Max pages per URL: {max_pages}, Enrich profiles: {enrich_profiles}")
         
-        # NOTE: Apollo.io detects Apify proxy - trying WITHOUT proxy first!
-        # Get proxy URL if configured
+        # If a proxy is explicitly configured, use it. Apollo is sensitive to some IP ranges,
+        # but residential or reputable proxy pools are still the best option for first login.
         proxy_url = None
-        use_proxy_option = False  # Force disable proxy for better success rate
-        
-        if proxy_config and use_proxy_option:  # Proxy disabled by default
+        use_proxy_option = bool(proxy_config)
+
+        if proxy_config and use_proxy_option:
             try:
                 from apify import ProxyConfiguration
-                # Create proxy configuration
                 if isinstance(proxy_config, dict) and proxy_config.get('useApifyProxy'):
                     proxy_configuration = ProxyConfiguration()
                 else:
                     proxy_configuration = ProxyConfiguration(**proxy_config) if isinstance(proxy_config, dict) else ProxyConfiguration()
                 proxy_url = await proxy_configuration.new_url()
-                log_message(f"Using proxy: {proxy_url[:50]}...")
+                log_message(f"Using proxy: {proxy_url[:50]}...", 'INFO')
             except Exception as e:
                 log_message(f"Proxy setup failed, continuing without proxy: {e}", 'WARNING')
                 proxy_url = None
         else:
-            log_message("⚠️  Proxy DISABLED - Apollo.io blocks Apify proxy IPs", 'WARNING')
+            log_message("⚠️  No proxy configuration provided - Apollo may block datacenter IPs", 'WARNING')
         
         # Initialize scraper
         scraper = None
@@ -84,6 +83,7 @@ async def main():
             
             # Try to load saved cookies from Apify Key-Value Store
             saved_cookies = None
+            kvs = None
             try:
                 kvs = await Actor.open_key_value_store()
                 saved_cookies = await kvs.get_value('apollo_cookies')
@@ -93,17 +93,38 @@ async def main():
                     log_message("⚠️  No saved cookies found, will use password login", 'WARNING')
             except Exception as e:
                 log_message(f"⚠️  Could not access Key-Value Store: {e}", 'WARNING')
-            
+
             # Attempt login (will try cookies first if available)
             login_success = scraper.login(
                 email=apollo_email,
                 password=apollo_password,
                 cookies=saved_cookies  # Pass cookies to new login method
             )
-            
+
             if not login_success:
-                raise RuntimeError('❌ Login to Apollo.io failed! Check credentials or try manual cookies.')
-            
+                log_message(
+                    '❌ Apollo login failed. This usually means CAPTCHA or anti-bot detection triggered. '
+                    'Check your cookie store, proxy configuration, or use a residential proxy.',
+                    'ERROR'
+                )
+                if saved_cookies and kvs is not None:
+                    try:
+                        await kvs.set_value('apollo_cookies', None)
+                        log_message('🧹 Cleared stale cookies from Key-Value Store to avoid retrying invalid sessions.', 'WARNING')
+                    except Exception as e:
+                        log_message(f"⚠️  Could not clear stale cookies: {e}", 'WARNING')
+                await Actor.push_data([
+                    {
+                        'status': 'login_failed',
+                        'error': 'Apollo login blocked by CAPTCHA or anti-bot detection',
+                        'apolloEmail': apollo_email,
+                        'proxyConfigured': bool(proxy_config),
+                        'savedCookiesAvailable': bool(saved_cookies),
+                        'message': 'Use a valid saved cookie session or a residential proxy and retry. Apollo blocks automation on fresh login attempts.'
+                    }
+                ])
+                return
+
             # Save/update cookies to Key-Value Store for future runs
             if scraper.logged_in:
                 try:
